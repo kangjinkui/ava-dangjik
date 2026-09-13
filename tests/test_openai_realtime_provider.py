@@ -207,6 +207,18 @@ class _ToolAdapter:
         self.sent_results.append((result, context))
 
 
+class _BlockingToolAdapter(_ToolAdapter):
+    def __init__(self, *, result):
+        super().__init__(result=result)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def handle_tool_call_event(self, event_data, context):
+        self.started.set()
+        await self.release.wait()
+        return self.result
+
+
 class _RecordingLogger:
     def __init__(self):
         self.warning_calls = []
@@ -498,6 +510,76 @@ async def test_success_tool_result_waits_for_parent_response_done(openai_config)
 
 
 @pytest.mark.asyncio
+async def test_pending_openai_tool_is_visible_then_completes_with_redacted_details(openai_config):
+    from src.core.models import CallSession
+    from src.core.session_store import SessionStore
+
+    provider = OpenAIRealtimeProvider(openai_config, on_event=None)
+    adapter = _BlockingToolAdapter(
+        result={
+            "status": "ok",
+            "message": "Resolved private question",
+            "secret": "must-not-be-exposed",
+            "result": {
+                "structured": {
+                    "status": "ok",
+                    "message": "private question must stay hidden",
+                    "data": {
+                        "answer_id": "answer-7",
+                        "release_id": 6,
+                        "next_action": "answer",
+                        "secret": "nested-secret-must-not-be-exposed",
+                    },
+                }
+            },
+        }
+    )
+    store = SessionStore()
+    session = CallSession(call_id="session-pending", caller_channel_id="session-pending")
+    await store.upsert_call(session)
+    provider.websocket = _OpenWebSocket()
+    provider.tool_adapter = adapter
+    provider._call_id = session.call_id
+    provider._session_store = store
+    provider._response_done_events["resp-pending"] = asyncio.Event()
+    provider._response_done_events["resp-pending"].set()
+    event = _function_call_event("resp-pending", "call-pending")
+    event["item"]["arguments"] = '{"query":"private question","scope":"manual"}'
+
+    task = asyncio.create_task(provider._handle_function_call(event))
+    await asyncio.wait_for(adapter.started.wait(), timeout=0.5)
+
+    pending = (await store.get_live_transcripts())["calls"][0]["tool_events"]
+    assert len(pending) == 1
+    assert pending[0]["phase"] == "started"
+    assert pending[0]["status"] == "running"
+    assert pending[0]["params"] == {"query": "***REDACTED***", "scope": "manual"}
+
+    adapter.release.set()
+    await asyncio.wait_for(task, timeout=0.5)
+
+    events = (await store.get_live_transcripts())["calls"][0]["tool_events"]
+    assert [item["phase"] for item in events] == ["started", "completed"]
+    assert events[0]["id"] == events[1]["id"]
+    assert events[0]["created_at"] <= events[1]["created_at"]
+    assert events[1]["status"] == "success"
+    assert events[1]["params"] == {"query": "***REDACTED***", "scope": "manual"}
+    assert events[1]["message"] == "Resolved ***REDACTED***"
+    assert events[1]["result"] == {
+        "status": "ok",
+        "answer_id": "answer-7",
+        "release_id": 6,
+        "next_action": "answer",
+    }
+    assert events[1]["duration_ms"] >= 0
+
+    await store.remove_call(session.call_id)
+    ended = (await store.get_live_transcripts())["calls"][0]
+    assert ended["active"] is False
+    assert ended["tool_events"] == events
+
+
+@pytest.mark.asyncio
 async def test_success_tool_result_delivery_survives_audit_failure(openai_config, monkeypatch):
     provider = OpenAIRealtimeProvider(openai_config, on_event=None)
     adapter = _ToolAdapter(result={"status": "ok", "message": "done"})
@@ -571,3 +653,6 @@ async def test_error_tool_output_waits_for_parent_response_done(openai_config):
     assert session.conversation_history == []
     assert session.tool_calls[0]["tool_call_id"] == "call-error"
     assert session.tool_calls[0]["status"] == "failure"
+    assert [event["phase"] for event in session.tool_events] == ["started", "completed"]
+    assert session.tool_events[0]["id"] == session.tool_events[1]["id"]
+    assert session.tool_events[1]["status"] == "failure"

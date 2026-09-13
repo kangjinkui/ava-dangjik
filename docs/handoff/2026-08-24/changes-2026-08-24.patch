@@ -1,0 +1,265 @@
+﻿diff --git a/config/ai-agent.yaml b/config/ai-agent.yaml
+index 40fe14e..f160458 100644
+--- a/config/ai-agent.yaml
++++ b/config/ai-agent.yaml
+@@ -1,6 +1,6 @@
+ active_pipeline: null
+ asterisk:
+-  app_name: asterisk-ai-voice-agent
++  app_name: ava-134-73   # 90 서버 dialplan의 Stasis(ava-134-73) 와 일치해야 함
+   # ARI call-control keepalive. With these defaults a silent packet drop is
+   # detected in approximately 20 seconds (interval + timeout), after which
+   # readiness fails and the reconnect supervisor takes over.
+@@ -9,10 +9,10 @@ asterisk:
+ audio_transport: audiosocket
+ audiosocket:
+   format: slin
+-  host: 127.0.0.1
++  host: 0.0.0.0    # 원격 Asterisk(98.23.133.90)가 접속해야 하므로 컨테이너 밖 수신
+   port: 8090
+ barge_in:
+-  enabled: true
++  enabled: false   # 에코가 상대 발화로 오인되어 AI 말이 계속 잘리는 문제로 비활성 (2026-08-24)
+   initial_protection_ms: 200
+   min_ms: 250
+   energy_threshold: 1000
+@@ -53,7 +53,7 @@ provider_failure_prompt: sorry-youre-having-problems
+ # provider_failure_redirect_extension: s
+ # provider_failure_redirect_priority: 1
+ contexts: {}
+-default_provider: local_hybrid
++default_provider: openai_realtime
+ downstream_mode: stream
+ external_media:
+   codec: ulaw
+@@ -65,6 +65,7 @@ external_media:
+   sample_rate: 16000
+   allowed_remote_hosts:
+     - 127.0.0.1
++    - 98.23.133.90
+ llm:
+   initial_greeting: Hello, how can I help you today?
+   prompt: Voice assistant. Answer in 5-8 words. Be direct. Expand only if asked.
+@@ -139,7 +140,7 @@ pipelines:
+           encoding: mulaw
+           sample_rate: 8000
+ profiles:
+-  default: telephony_ulaw_8k
++  default: telephony_enhanced_8k
+   openai_realtime_24k:
+     output_resampler: linear
+     chunk_ms: 20
+@@ -461,15 +462,23 @@ providers:
+       - llm
+       - tts
+     continuous_input: true
+-    egress_pacer_enabled: false
++    egress_pacer_enabled: true
+     egress_pacer_warmup_ms: 320
+-    enabled: false
+-    greeting: Hello, how can I help you today?
++    enabled: true
++    greeting: 안녕하세요. 강남구청 당직 AI 봇입니다. 무엇을 도와드릴까요?
+     input_encoding: ulaw
+-    input_gain_max_db: 0
+-    input_gain_target_rms: 0
++    # 인입 음성이 너무 작아 STT가 뭉개지는 문제로 입력 게인 정규화 활성화 (2026-08-24).
++    # 문제 시 둘 다 0으로 되돌리면 비활성.
++    input_gain_max_db: 18
++    input_gain_target_rms: 1400
+     input_sample_rate_hz: 8000
+-    instructions: You are a voice assistant. Always speak your responses out loud.
++    instructions: >-
++      당신은 강남구청 당직실의 AI 전화 응대 봇입니다. 항상 한국어로, 짧고 명확하게
++      소리 내어 답하세요. 한 번에 한두 문장씩만 짧게 말하고, 긴 안내는 나눠서
++      상대의 반응을 확인한 뒤 이어가세요. 민원인의 말을 끝까지 듣고 정중하게
++      응대하세요. 용건을 파악하고, 필요하면 이름과 연락처, 전달할 내용을 정확히
++      받아 적으세요. 모르는 정보(담당 부서 전화번호, 처리 절차, 규정 등)는
++      지어내지 말고, 당직 근무자에게 전달하겠다고 안내하세요.
+     max_response_output_tokens: 4096
+     api_version: ga
+     model: gpt-realtime
+@@ -488,7 +497,9 @@ providers:
+       create_response: true
+       prefix_padding_ms: 300
+       silence_duration_ms: 1000
+-      threshold: 0.5
++      # 0.5 → 0.8: AI 음성 에코가 서버 VAD에 발화로 오인되어 응답이 끊기는 문제 완화 (2026-08-24).
++      # 민원인 목소리가 잘 안 잡히면 0.7 → 0.6 순으로 낮춰볼 것.
++      threshold: 0.8
+       type: server_vad
+     type: openai_realtime
+     voice: alloy
+diff --git a/src/engine.py b/src/engine.py
+index b87108e..3565857 100644
+--- a/src/engine.py
++++ b/src/engine.py
+@@ -9303,6 +9303,7 @@ class Engine:
+                 if drain_task and not drain_task.done():
+                     drain_task.cancel()
+                 self._agent_output_active_calls.discard(call_id)
++                getattr(self, "_echo_gate_last_active_ts", {}).pop(call_id, None)
+                 fallback = self._terminal_fallback_tasks.pop(call_id, None)
+                 if fallback and not fallback.done():
+                     fallback.cancel()
+@@ -10339,14 +10340,54 @@ class Engine:
+                 # Google Live needs silence substitution during ordinary output.
+                 # Other native full-agent providers keep caller audio flowing so
+                 # their provider-owned VAD/barge-in remains functional.
+-                needs_gating = self._get_provider_kind(provider_name) == "google_live"
+-                
+-                if needs_gating and not session.audio_capture_enabled:
+-                    # Send silence instead of blocking so Google Live's continuous
++                provider_kind = self._get_provider_kind(provider_name)
++                needs_gating = provider_kind == "google_live"
++                if not needs_gating and provider_kind == "openai_realtime":
++                    # With barge-in disabled the caller cannot interrupt anyway, so
++                    # half-duplex gating is safe: silence-substitute during playback
++                    # to keep our own telephony echo out of OpenAI's server VAD
++                    # (echo was firing speech_started and flushing/cancelling the
++                    # response mid-sentence).
++                    try:
++                        _barge_cfg = getattr(self.config, "barge_in", None)
++                        needs_gating = _barge_cfg is not None and not bool(getattr(_barge_cfg, "enabled", True))
++                    except Exception:
++                        needs_gating = False
++
++                # Gate on the real caller-facing output window: gating tokens can
++                # clear seconds before the jitter buffer finishes draining, while
++                # _agent_output_active_calls is only discarded after transport
++                # drain completes (see _finish_provider_output_after_drain).
++                _output_active = caller_channel_id in (getattr(self, "_agent_output_active_calls", set()) or set())
++                gate_now = needs_gating and (_output_active or not session.audio_capture_enabled)
++                if needs_gating:
++                    _tail_map = getattr(self, "_echo_gate_last_active_ts", None)
++                    if _tail_map is None:
++                        _tail_map = {}
++                        self._echo_gate_last_active_ts = _tail_map
++                    _now_ts = time.time()
++                    if gate_now:
++                        _tail_map[caller_channel_id] = _now_ts
++                    else:
++                        # Tail guard: the caller-side echo of our audio arrives one
++                        # telephony round-trip after playback drains; keep
++                        # substituting briefly (at least 600 ms).
++                        try:
++                            _post_ms = int(getattr(getattr(self.config, "barge_in", None), "post_tts_end_protection_ms", 0) or 0)
++                        except Exception:
++                            _post_ms = 0
++                        _post_ms = max(_post_ms, 600)
++                        _last_ts = float(_tail_map.get(caller_channel_id, 0.0) or 0.0)
++                        if _last_ts and (_now_ts - _last_ts) * 1000 < _post_ms:
++                            gate_now = True
++
++                if gate_now:
++                    # Send silence instead of blocking so the provider's continuous
+                     # input timing and VAD state remain stable.
+                     logger.debug(
+-                        "🔇 GATING ACTIVE - Sending silence frame for Google Live (TTS playing)",
++                        "🔇 GATING ACTIVE - Sending silence frame during agent output",
+                         call_id=caller_channel_id,
++                        provider=provider_name,
+                         audio_capture_enabled=session.audio_capture_enabled,
+                     )
+                     pcm_bytes = b'\x00' * len(pcm_bytes)
+@@ -10448,8 +10489,8 @@ class Engine:
+                         frame_num=frame_num,
+                         frame_bytes=len(audio_bytes),
+                         pcm_bytes=len(pcm_bytes),
+-                        gating_active=needs_gating and not session.audio_capture_enabled,
+-                        is_silence=needs_gating and not session.audio_capture_enabled,
++                        gating_active=gate_now,
++                        is_silence=gate_now,
+                     )
+                 try:
+                     self._update_audio_diagnostics(session, "provider_in", pcm_bytes, "slin16", pcm_rate)
+@@ -13086,15 +13127,18 @@ class Engine:
+                 seq = self._provider_chunk_seq.get(call_id, 0) + 1
+                 self._provider_chunk_seq[call_id] = seq
+                 try:
+-                    logger.info(
+-                        "PROVIDER CHUNK",
+-                        call_id=call_id,
+-                        seq=seq,
+-                        size_bytes=len(chunk),
+-                        encoding=enc,
+-                        sample_rate_hz=rate,
+-                        approx_duration_ms=duration_ms,
+-                    )
++                    # Rate-limited: logging every 20 ms chunk at INFO measurably
++                    # loads the event loop and contributes to playback pacing drift.
++                    if seq <= 3 or seq % 50 == 0:
++                        logger.info(
++                            "PROVIDER CHUNK",
++                            call_id=call_id,
++                            seq=seq,
++                            size_bytes=len(chunk),
++                            encoding=enc,
++                            sample_rate_hz=rate,
++                            approx_duration_ms=duration_ms,
++                        )
+                 except Exception:
+                     pass
+                 try:
+diff --git a/src/providers/openai_realtime.py b/src/providers/openai_realtime.py
+index af730c9..11b1e08 100644
+--- a/src/providers/openai_realtime.py
++++ b/src/providers/openai_realtime.py
+@@ -2564,6 +2564,28 @@ class OpenAIRealtimeProvider(AIProviderInterface):
+     async def _emit_audio_done(self):
+         if not self.on_event or not self._call_id:
+             return
++        # OpenAI generates audio faster than real-time, so response.done arrives
++        # while _outbuf still holds seconds of unplayed audio. Cancelling the
++        # pacer at that point discards the tail of the response (the caller
++        # hears a mid-sentence cut). Wait for the pacer to finish emitting the
++        # buffered audio before declaring the segment done. Cancel/barge-in
++        # paths clear _outbuf first, so this wait exits immediately there.
++        try:
++            chunk_bytes, _ = self._pacer_params()
++            drain_deadline = time.monotonic() + 60.0
++            while (
++                self._pacer_running
++                and self.websocket
++                and self.websocket.state.name == "OPEN"
++                and time.monotonic() < drain_deadline
++            ):
++                async with self._pacer_lock:
++                    remaining = len(self._outbuf)
++                if remaining < max(1, chunk_bytes):
++                    break
++                await asyncio.sleep(0.02)
++        except Exception:
++            logger.debug("Egress pacer drain wait failed", call_id=self._call_id, exc_info=True)
+         try:
+             if self._in_audio_burst:
+                 is_greeting = bool(
+@@ -3107,6 +3129,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
+             logger.debug("Pacer warm-up error", call_id=call_id, exc_info=True)
+ 
+         # Emit loop at 20 ms cadence
++        next_deadline = time.monotonic()
+         try:
+             while self.websocket and self.websocket.state.name == "OPEN" and self._pacer_running:
+                 chunk = b""
+@@ -3155,7 +3178,19 @@ class OpenAIRealtimeProvider(AIProviderInterface):
+                     )
+                 except Exception:
+                     logger.error("Failed to emit paced AgentAudio", call_id=call_id, exc_info=True)
+-                await asyncio.sleep(0.02)
++                # Absolute-deadline pacing: sleep(0.02) alone drifts by the per-
++                # iteration processing cost (~15% observed), starving downstream
++                # playback and causing audible mid-sentence gaps. Schedule each
++                # chunk against a monotonic deadline and skip the sleep entirely
++                # when behind so the buffer refills at catch-up speed.
++                next_deadline += 0.02
++                now_mono = time.monotonic()
++                delay = next_deadline - now_mono
++                if delay > 0:
++                    await asyncio.sleep(delay)
++                elif delay < -0.5:
++                    # Long stall (event-loop hiccup): resync instead of flooding.
++                    next_deadline = now_mono
+         except asyncio.CancelledError:
+             return
+         except Exception:

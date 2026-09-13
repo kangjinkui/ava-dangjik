@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import copy
+import hmac
 import logging
 import math
 import os
@@ -98,6 +99,7 @@ from src.tools.telephony.hangup_policy import (
 from src.tools.runtime_config import ToolConfigPolicyError
 from src.tools.execution_history import (
     normalize_tool_terminal_status,
+    record_in_call_tool_start,
     record_in_call_tool_result,
     stable_tool_call_id,
 )
@@ -9303,6 +9305,7 @@ class Engine:
                 if drain_task and not drain_task.done():
                     drain_task.cancel()
                 self._agent_output_active_calls.discard(call_id)
+                getattr(self, "_echo_gate_last_active_ts", {}).pop(call_id, None)
                 fallback = self._terminal_fallback_tasks.pop(call_id, None)
                 if fallback and not fallback.done():
                     fallback.cancel()
@@ -10339,14 +10342,54 @@ class Engine:
                 # Google Live needs silence substitution during ordinary output.
                 # Other native full-agent providers keep caller audio flowing so
                 # their provider-owned VAD/barge-in remains functional.
-                needs_gating = self._get_provider_kind(provider_name) == "google_live"
-                
-                if needs_gating and not session.audio_capture_enabled:
-                    # Send silence instead of blocking so Google Live's continuous
+                provider_kind = self._get_provider_kind(provider_name)
+                needs_gating = provider_kind == "google_live"
+                if not needs_gating and provider_kind == "openai_realtime":
+                    # With barge-in disabled the caller cannot interrupt anyway, so
+                    # half-duplex gating is safe: silence-substitute during playback
+                    # to keep our own telephony echo out of OpenAI's server VAD
+                    # (echo was firing speech_started and flushing/cancelling the
+                    # response mid-sentence).
+                    try:
+                        _barge_cfg = getattr(self.config, "barge_in", None)
+                        needs_gating = _barge_cfg is not None and not bool(getattr(_barge_cfg, "enabled", True))
+                    except Exception:
+                        needs_gating = False
+
+                # Gate on the real caller-facing output window: gating tokens can
+                # clear seconds before the jitter buffer finishes draining, while
+                # _agent_output_active_calls is only discarded after transport
+                # drain completes (see _finish_provider_output_after_drain).
+                _output_active = caller_channel_id in (getattr(self, "_agent_output_active_calls", set()) or set())
+                gate_now = needs_gating and (_output_active or not session.audio_capture_enabled)
+                if needs_gating:
+                    _tail_map = getattr(self, "_echo_gate_last_active_ts", None)
+                    if _tail_map is None:
+                        _tail_map = {}
+                        self._echo_gate_last_active_ts = _tail_map
+                    _now_ts = time.time()
+                    if gate_now:
+                        _tail_map[caller_channel_id] = _now_ts
+                    else:
+                        # Tail guard: the caller-side echo of our audio arrives one
+                        # telephony round-trip after playback drains; keep
+                        # substituting briefly (at least 600 ms).
+                        try:
+                            _post_ms = int(getattr(getattr(self.config, "barge_in", None), "post_tts_end_protection_ms", 0) or 0)
+                        except Exception:
+                            _post_ms = 0
+                        _post_ms = max(_post_ms, 600)
+                        _last_ts = float(_tail_map.get(caller_channel_id, 0.0) or 0.0)
+                        if _last_ts and (_now_ts - _last_ts) * 1000 < _post_ms:
+                            gate_now = True
+
+                if gate_now:
+                    # Send silence instead of blocking so the provider's continuous
                     # input timing and VAD state remain stable.
                     logger.debug(
-                        "🔇 GATING ACTIVE - Sending silence frame for Google Live (TTS playing)",
+                        "🔇 GATING ACTIVE - Sending silence frame during agent output",
                         call_id=caller_channel_id,
+                        provider=provider_name,
                         audio_capture_enabled=session.audio_capture_enabled,
                     )
                     pcm_bytes = b'\x00' * len(pcm_bytes)
@@ -10448,8 +10491,8 @@ class Engine:
                         frame_num=frame_num,
                         frame_bytes=len(audio_bytes),
                         pcm_bytes=len(pcm_bytes),
-                        gating_active=needs_gating and not session.audio_capture_enabled,
-                        is_silence=needs_gating and not session.audio_capture_enabled,
+                        gating_active=gate_now,
+                        is_silence=gate_now,
                     )
                 try:
                     self._update_audio_diagnostics(session, "provider_in", pcm_bytes, "slin16", pcm_rate)
@@ -13086,15 +13129,18 @@ class Engine:
                 seq = self._provider_chunk_seq.get(call_id, 0) + 1
                 self._provider_chunk_seq[call_id] = seq
                 try:
-                    logger.info(
-                        "PROVIDER CHUNK",
-                        call_id=call_id,
-                        seq=seq,
-                        size_bytes=len(chunk),
-                        encoding=enc,
-                        sample_rate_hz=rate,
-                        approx_duration_ms=duration_ms,
-                    )
+                    # Rate-limited: logging every 20 ms chunk at INFO measurably
+                    # loads the event loop and contributes to playback pacing drift.
+                    if seq <= 3 or seq % 50 == 0:
+                        logger.info(
+                            "PROVIDER CHUNK",
+                            call_id=call_id,
+                            seq=seq,
+                            size_bytes=len(chunk),
+                            encoding=enc,
+                            sample_rate_hz=rate,
+                            approx_duration_ms=duration_ms,
+                        )
                 except Exception:
                     pass
                 try:
@@ -15988,6 +16034,7 @@ class Engine:
                             _tool_start = time.time()
                             tool_result_recorded = False
                             tool_task = None
+                            tool_event = None
                             try:
                                 tool = tool_registry.get(name)
                                 
@@ -15996,6 +16043,13 @@ class Engine:
                                     # Slow-response UX (pipeline only): speak a waiting message if the tool takes too long.
                                     slow_threshold_ms = int(getattr(tool, "slow_response_threshold_ms", 0) or 0)
                                     slow_message = str(getattr(tool, "slow_response_message", "") or "").strip()
+                                    tool_event = await record_in_call_tool_start(
+                                        session_store=self.session_store,
+                                        call_id=call_id,
+                                        tool_call_id=function_call_id,
+                                        tool_name=name,
+                                        parameters=args,
+                                    )
                                     tool_task = asyncio.create_task(tool.execute(args, tool_ctx))
                                     if slow_threshold_ms > 0 and slow_message:
                                         done, _pending = await asyncio.wait(
@@ -16033,6 +16087,7 @@ class Engine:
                                             parameters=args,
                                             result=result,
                                             duration_ms=tool_duration_ms,
+                                            tool_event_id=tool_event.get("id") if tool_event else None,
                                         )
                                     except Exception:
                                         logger.warning(
@@ -16261,6 +16316,13 @@ class Engine:
                                                             next_tool_start = time.time()
                                                             slow_threshold_ms = int(getattr(next_tool, "slow_response_threshold_ms", 0) or 0)
                                                             slow_message = str(getattr(next_tool, "slow_response_message", "") or "").strip()
+                                                            next_tool_event = await record_in_call_tool_start(
+                                                                session_store=self.session_store,
+                                                                call_id=call_id,
+                                                                tool_call_id=next_function_call_id,
+                                                                tool_name=next_name,
+                                                                parameters=next_args,
+                                                            )
                                                             next_task = asyncio.create_task(next_tool.execute(next_args, tool_ctx))
                                                             try:
                                                                 if slow_threshold_ms > 0 and slow_message:
@@ -16298,8 +16360,9 @@ class Engine:
                                                                         tool_name=next_name,
                                                                         canonical_name=tool_registry.canonicalize_tool_name(next_name),
                                                                         parameters=next_args,
-                                                                        result={"status": "cancelled", "message": "Tool execution cancelled"},
-                                                                        duration_ms=(time.time() - next_tool_start) * 1000,
+                                                                    result={"status": "cancelled", "message": "Tool execution cancelled"},
+                                                                    duration_ms=(time.time() - next_tool_start) * 1000,
+                                                                    tool_event_id=next_tool_event.get("id") if next_tool_event else None,
                                                                     )
                                                                 except Exception:
                                                                     logger.warning(
@@ -16319,8 +16382,12 @@ class Engine:
                                                                         tool_name=next_name,
                                                                         canonical_name=tool_registry.canonicalize_tool_name(next_name),
                                                                         parameters=next_args,
-                                                                        result={"status": "error", "message": str(next_error)},
+                                                                        result={
+                                                                            "status": "timeout" if isinstance(next_error, asyncio.TimeoutError) else "error",
+                                                                            "message": str(next_error) or "Tool execution timed out",
+                                                                        },
                                                                         duration_ms=(time.time() - next_tool_start) * 1000,
+                                                                        tool_event_id=next_tool_event.get("id") if next_tool_event else None,
                                                                     )
                                                                 except Exception:
                                                                     logger.warning(
@@ -16348,6 +16415,7 @@ class Engine:
                                                                     parameters=next_args,
                                                                     result=next_result,
                                                                     duration_ms=(time.time() - next_tool_start) * 1000,
+                                                                    tool_event_id=next_tool_event.get("id") if next_tool_event else None,
                                                                 )
                                                             except Exception:
                                                                 logger.warning(
@@ -16473,6 +16541,7 @@ class Engine:
                                             parameters=args,
                                             result={"status": "cancelled", "message": "Tool execution cancelled"},
                                             duration_ms=(time.time() - _tool_start) * 1000,
+                                            tool_event_id=tool_event.get("id") if tool_event else None,
                                         )
                                     except Exception:
                                         logger.warning(
@@ -16494,8 +16563,12 @@ class Engine:
                                             tool_name=name,
                                             canonical_name=tool_registry.canonicalize_tool_name(name),
                                             parameters=args,
-                                            result={"status": "error", "message": str(e)},
+                                            result={
+                                                "status": "timeout" if isinstance(e, asyncio.TimeoutError) else "error",
+                                                "message": str(e) or "Tool execution timed out",
+                                            },
                                             duration_ms=(time.time() - _tool_start) * 1000,
+                                            tool_event_id=tool_event.get("id") if tool_event else None,
                                         )
                                     except Exception:
                                         logger.warning(
@@ -19660,6 +19733,7 @@ class Engine:
             # (similar to /mcp/status) and should not include secrets or PII.
             app.router.add_get('/tools/definitions', self._tools_definitions_handler)
             app.router.add_get('/sessions/stats', self._sessions_stats_handler)
+            app.router.add_get('/sessions/transcripts', self._sessions_transcripts_handler)
             app.router.add_get('/config/state', self._config_state_handler)
             runner = web.AppRunner(app)
             await runner.setup()
@@ -19770,6 +19844,30 @@ class Engine:
             logger.debug("Sessions stats handler failed", error=str(exc), exc_info=True)
             return web.json_response({"active_calls": 0, "error": "internal_error"}, status=500)
 
+    async def _sessions_transcripts_handler(self, request):
+        """Return active and recently ended call transcripts for DANJIK polling."""
+        expected_token = os.getenv("DANJIK_KNOWLEDGE_TOKEN", "").strip()
+        if not expected_token:
+            return web.json_response({"calls": [], "error": "service_unavailable"}, status=503)
+
+        auth_header = request.headers.get("Authorization", "")
+        provided_token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
+        if not hmac.compare_digest(
+            provided_token.encode("utf-8"),
+            expected_token.encode("utf-8"),
+        ):
+            return web.json_response({"calls": [], "error": "unauthorized"}, status=401)
+
+        try:
+            return web.json_response(
+                await self.session_store.get_live_transcripts(),
+                status=200,
+                headers={"Cache-Control": "no-store"},
+            )
+        except Exception:
+            logger.debug("Sessions transcripts handler failed", exc_info=True)
+            return web.json_response({"calls": [], "error": "internal_error"}, status=500)
+
     async def _mcp_status_handler(self, request):
         """Return MCP server/tool status for Admin UI (sanitized)."""
         try:
@@ -19833,6 +19931,7 @@ class Engine:
 
         result = {"status": "error", "message": f"Tool '{function_name}' not found"}
         tool_start_time = time.time()
+        tool_event = None
 
         try:
             # Determine allowlisted tools for this call (contexts are the source of truth).
@@ -19909,6 +20008,13 @@ class Engine:
                     except Exception:
                         pass
                 if tool:
+                    tool_event = await record_in_call_tool_start(
+                        session_store=self.session_store,
+                        call_id=call_id,
+                        tool_call_id=function_call_id,
+                        tool_name=function_name,
+                        parameters=parameters,
+                    )
                     result = await tool.execute(parameters, context)
 
                     # Handle special tools
@@ -19944,6 +20050,7 @@ class Engine:
                     parameters=parameters,
                     result={"status": "cancelled", "message": "Tool execution cancelled"},
                     duration_ms=(time.time() - tool_start_time) * 1000,
+                    tool_event_id=tool_event.get("id") if tool_event else None,
                 )
             except Exception:
                 logger.warning(
@@ -19962,7 +20069,10 @@ class Engine:
                 error=str(e),
                 exc_info=True,
             )
-            result = {"status": "error", "message": str(e)}
+            result = {
+                "status": "timeout" if isinstance(e, asyncio.TimeoutError) else "error",
+                "message": str(e) or "Tool execution timed out",
+            }
         
         try:
             canonical_name = tool_registry.canonicalize_tool_name(function_name)
@@ -19975,6 +20085,7 @@ class Engine:
                 parameters=parameters,
                 result=result,
                 duration_ms=(time.time() - tool_start_time) * 1000,
+                tool_event_id=tool_event.get("id") if tool_event else None,
             )
         except Exception:
             logger.warning(

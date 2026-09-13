@@ -77,6 +77,148 @@ class TestSessionStore:
         assert await session_store.get_by_call_id("test_call_123") is None
         assert await session_store.get_by_channel_id("1758498324.399") is None
         assert await session_store.get_by_channel_id("Local/test@ai-agent-media-fork/n") is None
+
+    @pytest.mark.asyncio
+    async def test_live_transcripts_append_and_preserve_original_indexes(self, session_store, sample_session):
+        sample_session.created_at = 1_700_000_000
+        sample_session.status = "connected"
+        sample_session.conversation_history = [
+            {"role": "system", "content": "hidden", "timestamp": 1_700_000_001},
+            {"role": "user", "content": "hello", "timestamp": 1_700_000_002},
+        ]
+        await session_store.upsert_call(sample_session)
+
+        sample_session.conversation_history.append(
+            {"role": "assistant", "content": "hi", "timestamp": 1_700_000_003}
+        )
+        await session_store.upsert_call(sample_session)
+
+        payload = await session_store.get_live_transcripts()
+        call = payload["calls"][0]
+        assert call["active"] is True
+        assert call["started_at"] == "2023-11-14T22:13:20Z"
+        assert [message["id"] for message in call["messages"]] == ["1", "2"]
+        assert [message["text"] for message in call["messages"]] == ["hello", "hi"]
+
+    @pytest.mark.asyncio
+    async def test_live_transcripts_includes_active_call_with_empty_history(
+        self, session_store, sample_session
+    ):
+        await session_store.upsert_call(sample_session)
+
+        call = (await session_store.get_live_transcripts())["calls"][0]
+        assert call["call_id"] == "test_call_123"
+        assert call["started_at"].endswith("Z")
+        assert call["status"] == "initializing"
+        assert call["active"] is True
+        assert call["messages"] == []
+
+    @pytest.mark.asyncio
+    async def test_live_transcripts_retains_only_last_50_ended_calls(self, session_store):
+        for index in range(51):
+            session = CallSession(
+                call_id=f"ended-{index}",
+                caller_channel_id=f"channel-{index}",
+                status="complete",
+                conversation_history=[{"role": "user", "content": str(index)}],
+            )
+            await session_store.upsert_call(session)
+            await session_store.remove_call(session.call_id)
+
+        calls = (await session_store.get_live_transcripts())["calls"]
+        assert len(calls) == 50
+        assert calls[0]["call_id"] == "ended-1"
+        assert calls[-1]["call_id"] == "ended-50"
+        assert all(call["active"] is False for call in calls)
+
+    @pytest.mark.asyncio
+    async def test_live_transcripts_limits_messages_to_500(self, session_store, sample_session):
+        sample_session.conversation_history = [{"role": "user", "content": "message-0"}]
+        for index in range(1, 503):
+            sample_session.conversation_history.append(
+                {"role": "tool", "content": {"result": index}}
+            )
+            sample_session.conversation_history.append(
+                {"role": "assistant", "content": f"message-{index}"}
+            )
+        sample_session.conversation_history.extend(
+            [
+                {"role": "assistant", "content": None},
+                {"role": "user", "content": "  "},
+            ]
+        )
+        await session_store.upsert_call(sample_session)
+
+        messages = (await session_store.get_live_transcripts())["calls"][0]["messages"]
+        assert len(messages) == 500
+        assert messages[0]["id"] == "6"
+        assert messages[-1]["id"] == "1004"
+        assert messages[0]["text"] == "message-3"
+        assert messages[-1]["text"] == "message-502"
+
+    @pytest.mark.asyncio
+    async def test_ended_transcript_marks_unfinished_tool_event_unknown(
+        self, session_store, sample_session
+    ):
+        await session_store.upsert_call(sample_session)
+        await session_store.append_tool_event_if_active(
+            sample_session.call_id,
+            {
+                "id": "event-pending",
+                "tool_call_id": "tool-pending",
+                "name": "lookup_manual",
+                "phase": "started",
+                "status": "running",
+                "created_at": "2026-09-12T01:02:03+00:00",
+                "params": {},
+            },
+        )
+
+        await session_store.remove_call(sample_session.call_id)
+
+        event = (await session_store.get_live_transcripts())["calls"][0]["tool_events"][0]
+        assert event["phase"] == "started"
+        assert event["status"] == "unknown"
+        assert event["created_at"] == "2026-09-12T01:02:03Z"
+
+    @pytest.mark.asyncio
+    async def test_tool_event_retention_drops_complete_oldest_lifecycle(
+        self, session_store, sample_session
+    ):
+        await session_store.upsert_call(sample_session)
+        for index in range(251):
+            event_id = f"event-{index}"
+            await session_store.append_tool_event_if_active(
+                sample_session.call_id,
+                {
+                    "id": event_id,
+                    "tool_call_id": f"tool-{index}",
+                    "name": "lookup",
+                    "phase": "started",
+                    "status": "running",
+                    "created_at": index,
+                },
+            )
+            await session_store.append_tool_event_if_active(
+                sample_session.call_id,
+                {
+                    "id": event_id,
+                    "tool_call_id": f"tool-{index}",
+                    "name": "lookup",
+                    "phase": "completed",
+                    "status": "success",
+                    "created_at": index + 0.5,
+                    "duration_ms": 1,
+                },
+            )
+
+        events = (await session_store.get_live_transcripts())["calls"][0]["tool_events"]
+        assert len(events) == 500
+        assert {event["id"] for event in events} == {
+            f"event-{index}" for index in range(1, 251)
+        }
+        assert events[0]["id"] == "event-1"
+        assert events[-1]["id"] == "event-250"
     
     @pytest.mark.asyncio
     async def test_gating_token_operations(self, session_store, sample_session):

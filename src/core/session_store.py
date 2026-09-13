@@ -7,10 +7,12 @@ with a single, thread-safe store that enforces invariants.
 
 import asyncio
 import time
+from collections import OrderedDict
 from typing import Optional, Dict, Set, List
 import structlog
 
 from src.core.models import CallSession, PlaybackRef, ProviderSession
+from src.core.live_transcripts import MAX_TOOL_EVENTS_PER_CALL, transcript_snapshot
 
 logger = structlog.get_logger(__name__)
 
@@ -32,6 +34,7 @@ class SessionStore:
         self._sessions_by_channel_id: Dict[str, CallSession] = {}
         self._playbacks: Dict[str, PlaybackRef] = {}
         self._provider_sessions: Dict[str, ProviderSession] = {}
+        self._ended_transcripts: OrderedDict[str, dict] = OrderedDict()
         
         # Thread safety
         self._lock = asyncio.Lock()
@@ -43,6 +46,8 @@ class SessionStore:
         async with self._lock:
             # Store by call_id (canonical)
             self._sessions_by_call_id[session.call_id] = session
+            # A reused call ID represents a new active lifecycle.
+            self._ended_transcripts.pop(session.call_id, None)
             
             # Store by caller_channel_id
             self._sessions_by_channel_id[session.caller_channel_id] = session
@@ -79,6 +84,52 @@ class SessionStore:
                 session.tool_calls = []
             session.tool_calls.append(record)
             return True
+
+    @staticmethod
+    def _append_bounded_tool_event(session: CallSession, event: dict) -> None:
+        """Append one event while retaining complete lifecycle groups when possible."""
+        events = getattr(session, "tool_events", None)
+        if events is None:
+            events = []
+            session.tool_events = events
+        events.append(event)
+        while len(events) > MAX_TOOL_EVENTS_PER_CALL:
+            oldest_id = str(events[0].get("id") or "") if isinstance(events[0], dict) else ""
+            if oldest_id:
+                retained = [
+                    item for item in events
+                    if not isinstance(item, dict) or str(item.get("id") or "") != oldest_id
+                ]
+                if len(retained) < len(events):
+                    events[:] = retained
+                    continue
+            events.pop(0)
+
+    async def append_tool_event_if_active(self, call_id: str, event: dict) -> bool:
+        """Append a live tool lifecycle event only while the call is active."""
+        async with self._lock:
+            session = self._sessions_by_call_id.get(call_id)
+            if session is None:
+                return False
+            self._append_bounded_tool_event(session, event)
+            return True
+
+    async def append_tool_result_and_event_if_active(
+        self,
+        call_id: str,
+        record: dict,
+        event: dict,
+    ) -> bool:
+        """Atomically expose a terminal event and preserve existing tool history."""
+        async with self._lock:
+            session = self._sessions_by_call_id.get(call_id)
+            if session is None:
+                return False
+            if session.tool_calls is None:
+                session.tool_calls = []
+            session.tool_calls.append(record)
+            self._append_bounded_tool_event(session, event)
+            return True
     
     async def get_by_channel_id(self, channel_id: str) -> Optional[CallSession]:
         """Get session by any channel_id (caller, local, external_media)."""
@@ -99,6 +150,14 @@ class SessionStore:
             session = self._sessions_by_call_id.pop(call_id, None)
             if not session:
                 return None
+
+            # Preserve the final transcript before the mutable session leaves the
+            # active store. Bounded retention lets one-second pollers observe calls
+            # that end between requests.
+            self._ended_transcripts[call_id] = transcript_snapshot(session, active=False)
+            self._ended_transcripts.move_to_end(call_id)
+            while len(self._ended_transcripts) > 50:
+                self._ended_transcripts.popitem(last=False)
             
             # Remove all channel mappings
             self._sessions_by_channel_id.pop(session.caller_channel_id, None)
@@ -253,6 +312,16 @@ class SessionStore:
         """Get all active sessions."""
         async with self._lock:
             return list(self._sessions_by_call_id.values())
+
+    async def get_live_transcripts(self) -> Dict[str, List[dict]]:
+        """Return current calls plus the most recent ended-call snapshots."""
+        async with self._lock:
+            calls = list(self._ended_transcripts.values())
+            calls.extend(
+                transcript_snapshot(session, active=True)
+                for session in self._sessions_by_call_id.values()
+            )
+            return {"calls": calls}
 
     async def count_active_outbound_calls(
         self,

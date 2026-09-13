@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from src.tools.execution_history import (
+    build_in_call_tool_completed_event,
     build_in_call_tool_record,
     normalize_call_history_tool_redaction_mode,
     normalize_tool_terminal_status,
@@ -73,6 +74,32 @@ def test_failure_statuses_are_normalized(raw_status):
 )
 def test_unknown_or_malformed_statuses_fail_closed(result):
     assert normalize_tool_terminal_status(result) == "failure"
+
+
+def test_live_completed_event_distinguishes_unknown_timeout_and_cancelled():
+    unknown_result = {"status": "pending", "message": "Not terminal"}
+    unknown_record = build_in_call_tool_record(
+        call_id="call-1",
+        tool_call_id="tool-unknown",
+        tool_name="lookup",
+        parameters={},
+        result=unknown_result,
+    )
+    assert unknown_record["status"] == "failure"
+    assert build_in_call_tool_completed_event(
+        unknown_record, result=unknown_result
+    )["status"] == "unknown"
+
+    for raw_status, expected in (("timeout", "timeout"), ("cancelled", "cancelled")):
+        result = {"status": raw_status}
+        record = build_in_call_tool_record(
+            call_id="call-1",
+            tool_call_id=f"tool-{raw_status}",
+            tool_name="lookup",
+            parameters={},
+            result=result,
+        )
+        assert build_in_call_tool_completed_event(record, result=result)["status"] == expected
 
 
 def test_delete_uses_parameter_target_for_compensation():
@@ -167,6 +194,78 @@ def test_parameter_redaction_covers_common_pii_and_credential_shapes_without_suf
         "bypass": True,
         "compass": "north",
     }
+
+
+@pytest.mark.parametrize("redaction_mode", ["strict", "show_routing"])
+@pytest.mark.parametrize(
+    ("tool_name", "message", "expected"),
+    [
+        (
+            "mcp__danjik__collect_phone_keypad",
+            "입력된 전화번호는 010-1234-5678입니다.",
+            "연락처 수집 결과의 개인정보를 가렸습니다.",
+        ),
+        (
+            "danjik/send-location-link",
+            "서울시 강남구 학동로 426 위치를 확인했습니다.",
+            "위치 수집 결과의 개인정보를 가렸습니다.",
+        ),
+    ],
+)
+def test_live_collection_event_suppresses_newly_collected_pii_not_present_in_params(
+    redaction_mode,
+    tool_name,
+    message,
+    expected,
+):
+    result = {"status": "success", "message": message}
+    record = build_in_call_tool_record(
+        call_id="call-private",
+        tool_call_id="tool-private",
+        tool_name=tool_name,
+        parameters={"call_id": "call-private"},
+        result=result,
+        redaction_mode=redaction_mode,
+    )
+
+    event = build_in_call_tool_completed_event(record, result=result)
+
+    assert record["message"] == message
+    assert event["message"] == expected
+    assert "010-1234-5678" not in event["message"]
+    assert "학동로 426" not in event["message"]
+
+
+def test_live_dev_mode_preserves_complete_parameters_and_result():
+    parameters = {"query": "original query", "phone": "010-1234-5678", "address": "test address"}
+    result = {"status": "success", "message": "010-1234-5678", "result": {"structured": {"data": {"arbitrary_details": [parameters]}}}}
+    record = build_in_call_tool_record(
+        call_id="dev-call", tool_call_id="dev-tool", tool_name="collect_phone_keypad",
+        parameters=parameters, result=result, redaction_mode="off",
+    )
+    event = build_in_call_tool_completed_event(record, result=result)
+    assert event["params"] == parameters
+    assert event["message"] == result["message"]
+    assert event["result"] == result
+
+
+def test_live_noncollection_event_preserves_public_guidance_numbers():
+    result = {
+        "status": "success",
+        "message": "주정차 민원은 1544-1661로 안내해 주세요.",
+    }
+    record = build_in_call_tool_record(
+        call_id="call-guidance",
+        tool_call_id="tool-guidance",
+        tool_name="mcp__danjik__lookup_manual",
+        parameters={"topic": "parking"},
+        result=result,
+        redaction_mode="strict",
+    )
+
+    event = build_in_call_tool_completed_event(record, result=result)
+
+    assert event["message"] == "주정차 민원은 1544-1661로 안내해 주세요."
 
 
 @pytest.mark.parametrize("target_key", ["destination", "target", "extension", "queue", "mailbox"])
