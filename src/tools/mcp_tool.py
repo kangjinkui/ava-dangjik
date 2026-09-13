@@ -10,6 +10,9 @@ from src.tools.context import ToolExecutionContext
 
 logger = structlog.get_logger(__name__)
 
+_DANJIK_SERVER_ID = "danjik"
+_AVA_CONTEXT_ARGUMENT = "_ava_context"
+
 
 def _pick_field(data: Any, dotted: str) -> Optional[Any]:
     if data is None:
@@ -102,11 +105,21 @@ class MCPTool(Tool):
             exposed=self._exposed_name,
         )
 
+        arguments = dict(parameters or {})
+        # This reserved value is host-owned. Always discard a model-supplied copy,
+        # then add the current AVA call metadata only for the local duty MCP.
+        arguments.pop(_AVA_CONTEXT_ARGUMENT, None)
+        if self._server_id == _DANJIK_SERVER_ID:
+            arguments[_AVA_CONTEXT_ARGUMENT] = {
+                "call_id": str(getattr(context, "call_id", None) or ""),
+                "caller_number": str(getattr(context, "caller_number", None) or ""),
+            }
+
         timeout_ms = self._behavior.timeout_ms
         result = await self._manager.call_tool(
             server_id=self._server_id,
             tool_name=self._mcp_tool_name,
-            arguments=parameters or {},
+            arguments=arguments,
             timeout_ms=timeout_ms,
         )
 
