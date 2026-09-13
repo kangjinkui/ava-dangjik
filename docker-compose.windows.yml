@@ -1,0 +1,63 @@
+# Windows (Docker Desktop) override — 호스트 네트워킹 대신 bridge + 포트 매핑
+# 근거: docs/05-asterisk-server/03-ava-기동-실행일지-2026-08-22.md 4장
+# 사용:  docker compose -f docker-compose.yml -f docker-compose.windows.yml up -d ai_engine admin_ui
+services:
+  ai_engine:
+    environment:
+      DANJIK_KNOWLEDGE_MODE: ${DANJIK_KNOWLEDGE_MODE:-rag}
+      DANJIK_KNOWLEDGE_TOKEN: ${DANJIK_KNOWLEDGE_TOKEN:?Set a runtime knowledge token in .env}
+      DANJIK_KNOWLEDGE_INTERNAL_ORIGIN: http://danjik_app:8100
+    depends_on:
+      danjik_app:
+        condition: service_healthy
+    network_mode: !reset null
+    ports:
+      - "8090:8090"    # AudioSocket — 서버 Asterisk가 TCP로 접속해 오는 포트
+      - "15000:15000"  # health / metrics / MCP status
+    volumes:
+      # danjik-mcp 를 컨테이너 안에서 stdio 자식 프로세스로 띄우기 위한 마운트.
+      # AVA는 stdio transport만 지원하므로(A2 ⑤ 검증) 우리 코드가 컨테이너 안에 있어야 한다.
+      # 읽기 전용 — 통화 중 코드가 바뀔 일은 없다. DB만 쓰기 가능한 별도 마운트.
+      - "C:/Users/user/dev/ai 당직/danjik_mcp:/danjik/danjik_mcp:ro"
+      - "C:/Users/user/dev/ai 당직/db:/danjik/db:ro"
+      - "C:/Users/user/dev/ai 당직/data:/danjik/data"
+  admin_ui:
+    depends_on:
+      danjik_app:
+        condition: service_healthy
+    network_mode: !reset null
+    ports:
+      - "3003:3003"    # Admin UI
+  danjik_app:
+    build:
+      context: "../ai 당직"
+      dockerfile: Dockerfile
+    image: danjik-app:local
+    restart: unless-stopped
+    ports:
+      - "8100:8100"
+    volumes:
+      # MCP와 같은 72의 DB. 이미지에는 운영 데이터/비밀값을 넣지 않는다.
+      - "C:/Users/user/dev/ai 당직/data:/app/data"
+    environment:
+      DATABASE_URL: /app/data/danjik.db
+      DANJIK_AVA_URL: http://ai_engine:15000
+      DANJIK_KNOWLEDGE_DB: /app/data/knowledge.db
+      DANJIK_ORGANIZATION_ID: ${DANJIK_ORGANIZATION_ID:-gangnam-reference}
+      DANJIK_KNOWLEDGE_ADMIN_TOKEN: ${DANJIK_KNOWLEDGE_ADMIN_TOKEN:?Set a separate admin knowledge token in .env}
+      DANJIK_KNOWLEDGE_TOKEN: ${DANJIK_KNOWLEDGE_TOKEN:?Set a runtime knowledge token in .env}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set the existing OpenAI API key in .env}
+      DANJIK_OPENAI_MODEL: ${DANJIK_OPENAI_MODEL:-gpt-4o-mini}
+      DANJIK_SEMANTIC_SEARCH: "off"
+      WEB_DIST: /app/web/dist
+      TZ: Asia/Seoul
+      DANJIK_LOG_API_URL: ""
+      ARI_HOST: ${ASTERISK_HOST:-98.23.133.90}
+      # 90의 기존 danjik-switch와 중복 구독하지 않는다.
+      # 다이얼플랜 소유권을 옮길 때 별도로 설정한다.
+      ARI_PASSWORD: ${DANJIK_ARI_PASSWORD:-}
+      ARI_USERNAME: ${ASTERISK_ARI_USERNAME:-ava}
+      ARI_PORT: ${ASTERISK_ARI_PORT:-8088}
+      SWITCH_PUBLIC_URL: http://98.23.156.72:8100
+      SWITCH_WEBPHONE_WS: ws://98.23.133.90:8088/ws
+      LOCATION_PUBLIC_URL: http://98.23.156.72:8100

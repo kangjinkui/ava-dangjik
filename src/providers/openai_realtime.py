@@ -38,7 +38,11 @@ from ..config import OpenAIRealtimeProviderConfig
 # Tool calling support
 from src.tools.registry import tool_registry
 from src.tools.adapters.openai import OpenAIToolAdapter
-from src.tools.execution_history import record_in_call_tool_result
+from src.tools.execution_history import (
+    record_in_call_tool_start,
+    record_in_call_tool_result,
+    stable_tool_call_id,
+)
 
 logger = get_logger(__name__)
 
@@ -809,6 +813,8 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             parameters = {}
         tool_started_at = time.time()
         tool_result_recorded = False
+        tool_event = None
+        telemetry_tool_call_id = stable_tool_call_id(function_call_id)
 
         try:
             # Build context for tool execution
@@ -830,6 +836,13 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             }
             
             # Execute tool via adapter
+            tool_event = await record_in_call_tool_start(
+                session_store=getattr(self, "_session_store", None),
+                call_id=self._call_id,
+                tool_call_id=telemetry_tool_call_id,
+                tool_name=function_name,
+                parameters=parameters,
+            )
             result = await self.tool_adapter.handle_tool_call_event(event_data, context)
 
             # Check if this is a hangup_call tool that will trigger hangup
@@ -850,12 +863,13 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 await record_in_call_tool_result(
                     session_store=getattr(self, "_session_store", None),
                     call_id=self._call_id,
-                    tool_call_id=function_call_id,
+                    tool_call_id=telemetry_tool_call_id,
                     tool_name=function_name,
                     canonical_name=tool_registry.canonicalize_tool_name(function_name),
                     parameters=parameters,
                     result=result,
                     duration_ms=(time.time() - tool_started_at) * 1000,
+                    tool_event_id=tool_event.get("id") if tool_event else None,
                 )
             except Exception:
                 logger.warning(
@@ -926,18 +940,19 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     await record_in_call_tool_result(
                         session_store=getattr(self, "_session_store", None),
                         call_id=self._call_id,
-                        tool_call_id=function_call_id,
+                        tool_call_id=telemetry_tool_call_id,
                         tool_name=function_name,
                         canonical_name=tool_registry.canonicalize_tool_name(function_name),
                         parameters=parameters,
                         result={"status": "cancelled", "message": "Tool execution cancelled"},
                         duration_ms=(time.time() - tool_started_at) * 1000,
+                        tool_event_id=tool_event.get("id") if tool_event else None,
                     )
                 except Exception:
                     logger.warning(
                         "Failed to persist cancelled OpenAI tool result",
                         call_id=self._call_id,
-                        tool_call_id=function_call_id,
+                        tool_call_id=telemetry_tool_call_id,
                         exc_info=True,
                     )
             raise
@@ -957,8 +972,12 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                         tool_name=function_name,
                         canonical_name=tool_registry.canonicalize_tool_name(function_name),
                         parameters=parameters,
-                        result={"status": "error", "message": str(e)},
+                        result={
+                            "status": "timeout" if isinstance(e, asyncio.TimeoutError) else "error",
+                            "message": str(e) or "Tool execution timed out",
+                        },
                         duration_ms=(time.time() - tool_started_at) * 1000,
+                        tool_event_id=tool_event.get("id") if tool_event else None,
                     )
                 except Exception:
                     logger.warning(
@@ -2631,7 +2650,6 @@ class OpenAIRealtimeProvider(AIProviderInterface):
     async def _emit_audio_done(self, *, farewell_audio_complete: bool = False):
         if not self.on_event or not self._call_id:
             return
-
         # AgentAudioDone may block while downstream WebSocket playback reaches
         # its correlated boundary. Claim and cancel the no-audio fallback first
         # once this farewell has demonstrably produced audio, then emit the
@@ -2647,6 +2665,28 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         if farewell_completed:
             farewell_completed = self._claim_farewell_hangup() is not None
 
+        # OpenAI generates audio faster than real-time, so response.done arrives
+        # while _outbuf still holds seconds of unplayed audio. Cancelling the
+        # pacer at that point discards the tail of the response (the caller
+        # hears a mid-sentence cut). Wait for the pacer to finish emitting the
+        # buffered audio before declaring the segment done. Cancel/barge-in
+        # paths clear _outbuf first, so this wait exits immediately there.
+        try:
+            chunk_bytes, _ = self._pacer_params()
+            drain_deadline = time.monotonic() + 60.0
+            while (
+                self._pacer_running
+                and self.websocket
+                and self.websocket.state.name == "OPEN"
+                and time.monotonic() < drain_deadline
+            ):
+                async with self._pacer_lock:
+                    remaining = len(self._outbuf)
+                if remaining < max(1, chunk_bytes):
+                    break
+                await asyncio.sleep(0.02)
+        except Exception:
+            logger.debug("Egress pacer drain wait failed", call_id=self._call_id, exc_info=True)
         try:
             if self._in_audio_burst:
                 is_greeting = bool(
@@ -3184,6 +3224,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             logger.debug("Pacer warm-up error", call_id=call_id, exc_info=True)
 
         # Emit loop at 20 ms cadence
+        next_deadline = time.monotonic()
         try:
             while self.websocket and self.websocket.state.name == "OPEN" and self._pacer_running:
                 chunk = b""
@@ -3232,7 +3273,19 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     )
                 except Exception:
                     logger.error("Failed to emit paced AgentAudio", call_id=call_id, exc_info=True)
-                await asyncio.sleep(0.02)
+                # Absolute-deadline pacing: sleep(0.02) alone drifts by the per-
+                # iteration processing cost (~15% observed), starving downstream
+                # playback and causing audible mid-sentence gaps. Schedule each
+                # chunk against a monotonic deadline and skip the sleep entirely
+                # when behind so the buffer refills at catch-up speed.
+                next_deadline += 0.02
+                now_mono = time.monotonic()
+                delay = next_deadline - now_mono
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                elif delay < -0.5:
+                    # Long stall (event-loop hiccup): resync instead of flooding.
+                    next_deadline = now_mono
         except asyncio.CancelledError:
             return
         except Exception:

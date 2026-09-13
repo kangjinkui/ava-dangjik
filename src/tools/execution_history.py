@@ -43,6 +43,20 @@ _REDACTED_PARAMETER_VALUE = "***REDACTED***"
 CALL_HISTORY_TOOL_REDACTION_MODES = frozenset({"strict", "show_routing", "off"})
 _DEFAULT_TOOL_REDACTION_MODE = "strict"
 _warned_invalid_redaction_modes: set[str] = set()
+_TOOL_EVENT_RESULT_KEYS = {
+    "answer_id",
+    "release_id",
+    "next_action",
+    "scenario_id",
+    "scenario_ids",
+    "route",
+    "needs_human",
+    "hit",
+}
+_SENSITIVE_COLLECTION_TOOL_MESSAGES = {
+    "collect_phone_keypad": "연락처 수집 결과의 개인정보를 가렸습니다.",
+    "send_location_link": "위치 수집 결과의 개인정보를 가렸습니다.",
+}
 
 _SECRET_PARAMETER_KEYS = {
     # Credentials and authorization material. This follows the repository-wide
@@ -171,6 +185,12 @@ def stable_tool_call_id(value: Any = None) -> str:
     return candidate or f"generated-{uuid4().hex}"
 
 
+def stable_tool_event_id(value: Any = None) -> str:
+    """Return a stable event id shared by one invocation's lifecycle records."""
+    candidate = str(value or "").strip()
+    return candidate or f"tool-event-{uuid4().hex}"
+
+
 def normalize_tool_terminal_status(result: Any) -> str:
     """Reduce provider/tool-specific outcomes to the terminal reporting contract.
 
@@ -229,6 +249,15 @@ def resolve_call_history_tool_redaction_mode() -> str:
 
 def _normalized_parameter_key(key: Any) -> str:
     return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key)).lower().replace("-", "_")
+
+
+def _collection_tool_message(tool_name: Any) -> Optional[str]:
+    """Return a neutral live-feed message for tools that collect fresh caller PII."""
+    normalized = _normalized_parameter_key(tool_name).replace(".", "_").replace("/", "_")
+    for suffix, message in _SENSITIVE_COLLECTION_TOOL_MESSAGES.items():
+        if normalized == suffix or normalized.endswith(f"_{suffix}"):
+            return message
+    return None
 
 
 def _matches_key_family(normalized: str, keys: set[str], suffixes: set[str]) -> bool:
@@ -436,6 +465,156 @@ def build_in_call_tool_record(
     }
 
 
+def build_in_call_tool_started_event(
+    *,
+    tool_call_id: Any,
+    tool_name: str,
+    parameters: Any,
+    canonical_name: Optional[str] = None,
+    redaction_mode: Optional[str] = None,
+    event_id: Any = None,
+) -> Dict[str, Any]:
+    """Build a redacted event immediately before an in-call tool starts."""
+    mode = (
+        resolve_call_history_tool_redaction_mode()
+        if redaction_mode is None
+        else normalize_call_history_tool_redaction_mode(redaction_mode)
+    )
+    params, _, _ = _sanitize_persisted_parameters(
+        parameters if isinstance(parameters, dict) else {},
+        mode=mode,
+    )
+    name = str(canonical_name or tool_name or "unknown").strip() or "unknown"
+    return {
+        "id": stable_tool_event_id(event_id),
+        "tool_call_id": stable_tool_call_id(tool_call_id),
+        "name": name,
+        "phase": "started",
+        "status": "running",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "params": params,
+    }
+
+
+def build_in_call_tool_completed_event(
+    record: Dict[str, Any],
+    *,
+    event_id: Any = None,
+    result: Any = None,
+) -> Dict[str, Any]:
+    """Project a persisted terminal tool record into the live event contract."""
+    raw_result = str(record.get("result") or "").strip().lower()
+    source_status = ""
+    if isinstance(result, dict):
+        source_status = str(result.get("status") or "").strip().lower()
+    if source_status == "timeout":
+        status = "timeout"
+    elif source_status in {"cancelled", "canceled"}:
+        status = "cancelled"
+    elif source_status in _FAILURE_STATUSES or (
+        isinstance(result, dict) and result.get("error")
+    ):
+        status = "failure"
+    elif source_status in _SUCCESS_STATUSES:
+        status = "success"
+    elif isinstance(result, dict) and isinstance(result.get("success"), bool):
+        status = "success" if result["success"] else "failure"
+    else:
+        status = "unknown"
+
+    safe_result: Dict[str, Any] = {"status": raw_result or status}
+
+    def copy_safe_fields(source: Any) -> None:
+        if not isinstance(source, dict):
+            return
+        for key in _TOOL_EVENT_RESULT_KEYS:
+            value = source.get(key)
+            if isinstance(value, str):
+                safe_result[key] = value[:512]
+            elif value is None or isinstance(value, (bool, int, float)):
+                if key in source:
+                    safe_result[key] = value
+            elif isinstance(value, (list, tuple)):
+                safe_result[key] = [
+                    item[:512] if isinstance(item, str) else item
+                    for item in list(value)[:20]
+                    if item is None or isinstance(item, (bool, int, float, str))
+                ]
+
+    if isinstance(result, dict):
+        copy_safe_fields(result)
+        # MCPTool wraps the server payload at result.structured.data. Project
+        # only the known operational identifiers; never expose the raw MCP body.
+        wrapped_result = result.get("result")
+        structured = wrapped_result.get("structured") if isinstance(wrapped_result, dict) else None
+        data = structured.get("data") if isinstance(structured, dict) else None
+        copy_safe_fields(data)
+
+    event = {
+        "id": stable_tool_event_id(event_id),
+        "tool_call_id": stable_tool_call_id(record.get("tool_call_id")),
+        "name": str(record.get("name") or "unknown"),
+        "phase": "completed",
+        "status": status,
+        "created_at": str(record.get("timestamp") or datetime.now(timezone.utc).isoformat()),
+        "duration_ms": round(max(0.0, float(record.get("duration_ms") or 0.0)), 2),
+        "params": record.get("params") if isinstance(record.get("params"), dict) else {},
+        "result": result if record.get("redaction_mode") == "off" else safe_result,
+    }
+    if record.get("message") is not None:
+        collection_message = _collection_tool_message(record.get("name"))
+        if collection_message and record.get("redaction_mode") != "off":
+            event["message"] = collection_message
+        else:
+            event["message"] = str(record["message"])
+    return event
+
+
+async def record_in_call_tool_start(
+    *,
+    session_store: Any,
+    call_id: str,
+    tool_call_id: Any,
+    tool_name: str,
+    parameters: Any,
+    canonical_name: Optional[str] = None,
+    redaction_mode: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Append a real running event before execution begins, best-effort."""
+    event: Optional[Dict[str, Any]] = None
+    try:
+        event = build_in_call_tool_started_event(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            parameters=parameters,
+            canonical_name=canonical_name,
+            redaction_mode=redaction_mode,
+        )
+        if session_store is None:
+            return None
+        atomic_append = getattr(session_store, "append_tool_event_if_active", None)
+        if callable(atomic_append):
+            return event if await atomic_append(call_id, event) else None
+
+        current = await session_store.get_by_call_id(call_id)
+        if current is None:
+            return None
+        if getattr(current, "tool_events", None) is None:
+            current.tool_events = []
+        current.tool_events.append(event)
+        await session_store.upsert_call(current)
+        return event
+    except Exception:
+        logger.debug(
+            "Failed to record tool start in live history",
+            call_id=call_id,
+            tool=str(canonical_name or tool_name or ""),
+            tool_call_id=str(tool_call_id or ""),
+            exc_info=True,
+        )
+        return None
+
+
 async def record_in_call_tool_result(
     *,
     session_store: Any,
@@ -447,6 +626,7 @@ async def record_in_call_tool_result(
     duration_ms: float = 0.0,
     canonical_name: Optional[str] = None,
     redaction_mode: Optional[str] = None,
+    tool_event_id: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """Append one terminal result to ``CallSession.tool_calls`` best-effort.
 
@@ -466,8 +646,26 @@ async def record_in_call_tool_result(
             canonical_name=canonical_name,
             redaction_mode=redaction_mode,
         )
+        event = build_in_call_tool_completed_event(
+            record,
+            event_id=tool_event_id,
+            result=result,
+        )
         if session_store is None:
             return None
+        atomic_pair_append = getattr(
+            session_store, "append_tool_result_and_event_if_active", None
+        )
+        if callable(atomic_pair_append):
+            if not await atomic_pair_append(call_id, record, event):
+                logger.debug(
+                    "Tool result history skipped; session no longer active",
+                    call_id=call_id,
+                    tool=record["name"],
+                    tool_call_id=record["tool_call_id"],
+                )
+                return None
+            return record
         atomic_append = getattr(session_store, "append_tool_call_if_active", None)
         if callable(atomic_append):
             if not await atomic_append(call_id, record):
@@ -478,6 +676,9 @@ async def record_in_call_tool_result(
                     tool_call_id=record["tool_call_id"],
                 )
                 return None
+            append_event = getattr(session_store, "append_tool_event_if_active", None)
+            if callable(append_event):
+                await append_event(call_id, event)
             return record
 
         # Lightweight test/custom stores may not expose the atomic helper.
@@ -495,6 +696,9 @@ async def record_in_call_tool_result(
         if getattr(current, "tool_calls", None) is None:
             current.tool_calls = []
         current.tool_calls.append(record)
+        if getattr(current, "tool_events", None) is None:
+            current.tool_events = []
+        current.tool_events.append(event)
         await session_store.upsert_call(current)
         logger.debug(
             "Tool result recorded in call history",
