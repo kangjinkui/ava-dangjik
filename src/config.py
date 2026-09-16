@@ -746,6 +746,10 @@ class OpenAIRealtimeProviderConfig(BaseModel):
         prefix_padding_ms: int = Field(default=200)
 
     turn_detection: Optional[TurnDetectionConfig] = None
+    # Optional tool_choice applied to the caller's first turn after the greeting
+    # (e.g. "required" forces a tool call before the model answers on its own).
+    # Reverts to "auto" as soon as the first function call arrives.
+    first_turn_tool_choice: Optional[str] = None
 
 
 class GrokProviderConfig(BaseModel):

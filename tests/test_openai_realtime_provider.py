@@ -656,3 +656,93 @@ async def test_error_tool_output_waits_for_parent_response_done(openai_config):
     assert [event["phase"] for event in session.tool_events] == ["started", "completed"]
     assert session.tool_events[0]["id"] == session.tool_events[1]["id"]
     assert session.tool_events[1]["status"] == "failure"
+
+
+def _first_turn_provider(openai_config, *, tool_choice="required", tools=("mcp_lookup",)):
+    config = openai_config.model_copy(update={"first_turn_tool_choice": tool_choice})
+    provider = OpenAIRealtimeProvider(config, on_event=None)
+    provider._call_id = "call-first-turn"
+    provider.websocket = _OpenWebSocket()
+    provider._allowed_tools = list(tools)
+    provider._send_json = AsyncMock()
+    return provider
+
+
+def _sent_tool_choices(provider):
+    return [
+        call.args[0]["session"]["tool_choice"]
+        for call in provider._send_json.await_args_list
+        if call.args[0].get("type") == "session.update"
+        and "tool_choice" in call.args[0].get("session", {})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_first_turn_tool_choice_disabled_by_default(openai_config):
+    provider = _first_turn_provider(openai_config, tool_choice=None)
+
+    await provider._arm_first_turn_tool_choice()
+
+    assert _sent_tool_choices(provider) == []
+    assert provider._first_turn_tool_choice_active is False
+
+
+@pytest.mark.asyncio
+async def test_first_turn_tool_choice_skipped_without_tools(openai_config):
+    provider = _first_turn_provider(openai_config, tools=())
+
+    await provider._arm_first_turn_tool_choice()
+
+    assert _sent_tool_choices(provider) == []
+
+
+@pytest.mark.asyncio
+async def test_greeting_completion_arms_first_turn_tool_choice_once(openai_config):
+    provider = _first_turn_provider(openai_config)
+    provider._re_enable_vad = AsyncMock()
+    provider._greeting_response_id = "resp-greeting"
+    provider._current_response_id = "resp-greeting"
+
+    await provider._handle_event({"type": "response.done", "response": {"id": "resp-greeting"}})
+    await provider._arm_first_turn_tool_choice()
+
+    assert _sent_tool_choices(provider) == ["required"]
+    assert provider._first_turn_tool_choice_active is True
+
+
+@pytest.mark.asyncio
+async def test_greeting_vad_fallback_arms_first_turn_tool_choice(openai_config, monkeypatch):
+    provider = _first_turn_provider(openai_config)
+    provider._greeting_completed = False
+    provider._re_enable_vad = AsyncMock()
+    provider.release_greeting_transport_guard = AsyncMock()
+    monkeypatch.setattr(openai_realtime_module.asyncio, "sleep", AsyncMock())
+
+    await provider._greeting_vad_fallback()
+
+    assert _sent_tool_choices(provider) == ["required"]
+
+
+@pytest.mark.asyncio
+async def test_first_function_call_releases_tool_choice_before_result(openai_config):
+    provider = _first_turn_provider(openai_config)
+    adapter = _ToolAdapter(result={"status": "ok", "message": "done"})
+    provider.tool_adapter = adapter
+    provider._session_store = SimpleNamespace(
+        get_by_call_id=AsyncMock(
+            return_value=SimpleNamespace(tool_calls=[], conversation_history=[])
+        ),
+        upsert_call=AsyncMock(),
+    )
+    sentinel = asyncio.Event()
+    sentinel.set()
+    provider._response_done_events["resp-forced"] = sentinel
+
+    await provider._arm_first_turn_tool_choice()
+    await provider._handle_function_call(_function_call_event("resp-forced", "call-forced"))
+    # A later tool call and a late greeting fallback must not re-arm enforcement.
+    await provider._arm_first_turn_tool_choice()
+
+    assert _sent_tool_choices(provider) == ["required", "auto"]
+    assert provider._first_turn_tool_choice_active is False
+    assert len(adapter.sent_results) == 1

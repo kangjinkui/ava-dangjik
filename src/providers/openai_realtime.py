@@ -184,7 +184,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         self._assistant_transcript_buffers: Dict[str, str] = {}
         self._input_info_logged: bool = False
         self._allowed_tools: Optional[List[str]] = None
-        
+        # First-turn tool enforcement (config.first_turn_tool_choice):
+        # armed after the greeting, released on the first function call.
+        self._first_turn_tool_choice_active: bool = False
+        self._first_turn_tool_choice_done: bool = False
+
         # Turn latency tracking (Milestone 21 - Call History)
         self._turn_start_time: Optional[float] = None
         self._turn_first_audio_received: bool = False
@@ -803,6 +807,9 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             parameters = {}
         if not isinstance(parameters, dict):
             parameters = {}
+        # The forced first turn produced its tool call; the follow-up response
+        # must be free to speak the result instead of calling tools again.
+        await self._release_first_turn_tool_choice()
         tool_started_at = time.time()
         tool_result_recorded = False
         tool_event = None
@@ -1320,7 +1327,13 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             tools = self.tool_adapter.get_tools_config(list(self._allowed_tools or []))
             if tools:
                 session["tools"] = tools
-                session["tool_choice"] = "auto"  # Let OpenAI decide when to call tools
+                # Let OpenAI decide when to call tools, unless first-turn enforcement
+                # is still armed (e.g. session re-sent after a reconnect).
+                session["tool_choice"] = (
+                    self._first_turn_tool_choice_value()
+                    if self._first_turn_tool_choice_active
+                    else "auto"
+                )
                 logger.info(
                     f"🛠️  OpenAI session configured with {len(tools)} tools",
                     call_id=self._call_id,
@@ -1441,10 +1454,77 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     await self._re_enable_vad()
                 finally:
                     await self.release_greeting_transport_guard()
+                    await self._arm_first_turn_tool_choice()
         except asyncio.CancelledError:
             pass  # Task cancelled on session stop
         except Exception:
             logger.debug("VAD fallback failed", call_id=self._call_id, exc_info=True)
+
+    def _first_turn_tool_choice_value(self) -> Optional[str]:
+        value = str(getattr(self.config, "first_turn_tool_choice", None) or "").strip()
+        return value or None
+
+    async def _arm_first_turn_tool_choice(self) -> None:
+        """Force a tool call on the caller's first turn (after the greeting).
+
+        With tool_choice=auto the model sometimes answers the first request by
+        itself instead of consulting the business tool the prompt mandates.
+        """
+        value = self._first_turn_tool_choice_value()
+        if (
+            not value
+            or self._first_turn_tool_choice_active
+            or self._first_turn_tool_choice_done
+            or not self._allowed_tools
+            or not self.websocket
+            or self.websocket.state.name != "OPEN"
+        ):
+            return
+        self._first_turn_tool_choice_active = True
+        try:
+            await self._send_json(
+                {
+                    "type": "session.update",
+                    "event_id": f"sess-tools-first-turn-{uuid.uuid4()}",
+                    "session": self._ga_session_type({"tool_choice": value}),
+                }
+            )
+            logger.info(
+                "🛠️  First-turn tool_choice armed",
+                call_id=self._call_id,
+                tool_choice=value,
+            )
+        except Exception:
+            self._first_turn_tool_choice_active = False
+            logger.warning(
+                "Failed to arm first-turn tool_choice",
+                call_id=self._call_id,
+                exc_info=True,
+            )
+
+    async def _release_first_turn_tool_choice(self) -> None:
+        """Return to tool_choice=auto so the model can speak the tool result."""
+        if not self._first_turn_tool_choice_active:
+            return
+        self._first_turn_tool_choice_active = False
+        self._first_turn_tool_choice_done = True
+        if not self.websocket or self.websocket.state.name != "OPEN":
+            return
+        try:
+            await self._send_json(
+                {
+                    "type": "session.update",
+                    "event_id": f"sess-tools-auto-{uuid.uuid4()}",
+                    "session": self._ga_session_type({"tool_choice": "auto"}),
+                }
+            )
+            logger.info("🛠️  First-turn tool_choice released", call_id=self._call_id)
+        except Exception:
+            logger.warning(
+                "Failed to release first-turn tool_choice",
+                call_id=self._call_id,
+                exc_info=True,
+            )
 
     async def _re_enable_vad(self):
         """Re-enable turn_detection after greeting completes."""
@@ -2094,6 +2174,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 )
                 # Re-enable turn_detection now that greeting is fully generated
                 await self._re_enable_vad()
+                await self._arm_first_turn_tool_choice()
 
                 # AgentAudioDone retains greeting gating through caller-facing
                 # drain. A no-audio greeting has nothing to drain and clears

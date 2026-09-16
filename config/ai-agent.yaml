@@ -56,6 +56,9 @@ contexts:
          이 도구를 다른 어떤 업무 도구보다 **먼저** 부른다. 조회 결과를 받기 전에는
          send_location_link · file_intake 를 부르지 않는다.
          민원인이 접수를 원한다고 말해도 조회가 먼저다.
+         민원인이 요청·신고를 말하면 어떤 질문이나 안내보다 먼저 이 조회 도구를 호출한다.
+         도구 결과 없이 상황·종류·규모·위치 같은 추가 정보를 스스로 되묻지 않는다. 추가 질문은 도구가 ask_question으로 돌려준 질문만 한다.
+         발음이 불분명하게 들려도 들은 내용을 그대로 query에 넣어 조회한다.
 
       3. 도구의 message는 발효된 지식에서 구성하고 서버가 확인한 최종 안내다. 그대로 말한다.
          structured.data의 출처, 번호, 내부 분기, reason 등을 민원인에게 읽지 않는다.
@@ -75,9 +78,10 @@ contexts:
       5. 연락처와 위치 수집은 4번의 next_action 이 file_intake 일 때만 시작한다.
          그 전에는 연락처를 묻지 않는다. 받는 방식은 모든 민원에서 같다.
          연락처는 AVA가 해당 통화에서 자동 수집한 발신번호를 업무 도구가 확인한다. 키패드 입력을 요구하지 않는다.
-         send_location_link로 발신번호에 문자를 보내고 지도에서 전송한 위치가 수신될 때까지 기다린다.
-         send_location_link / wait_location이 반환되면 해당 수집 단계를 따른다.
-         말로 들은 번호·주소로 대체하지 않는다. 발신번호가 없거나 사용 불가하면 당직자에게 연결한다.
+         위치를 받는 방법은 업무 도구의 next_action을 따른다.
+         send_location_link / wait_location이 반환되면 발신번호로 문자를 보내고 지도에서 전송한 위치가 수신될 때까지 기다린다.
+         도구가 위치를 말로 물으면(ask_question·ask_location) 민원인이 말한 위치를 known_facts의 location과 file_intake의 location에 들은 그대로 넣는다.
+         전화번호는 말로 받지 않는다. 발신번호 때문에 당직자에게 연결할지는 도구가 정한다.
          공사 소음은 수신된 전화번호와 위치를 소음기동반 현장대기조에 문자로 전달한다.
          현장대기조 연락처를 민원인 전화번호로 넣지 않는다.
          위치와 연락처를 정책 지식의 근거로 사용하지 않는다. 개인정보를 반복해서 낭독하지 않는다.
@@ -182,6 +186,10 @@ providers:
     input_sample_rate_hz: 8000
     instructions: You are a concise voice assistant. Respond clearly and keep answers under 20 words unless more detail is requested.
     api_version: ga
+    # 인사 뒤 민원인 첫 발화에서는 도구 호출을 강제한다(tool_choice=required).
+    # auto 만으로는 모델이 지식 조회 없이 스스로 되묻는 경우가 있었다(2026-09-16 통화 1789560188.2143).
+    # 첫 도구 호출이 들어오면 auto 로 되돌린다.
+    first_turn_tool_choice: required
     model: gpt-realtime
     organization: ''
     output_encoding: linear16
