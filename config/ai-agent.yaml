@@ -244,8 +244,11 @@ mcp:
       transport: stdio
       command: ["python3", "-m", "danjik_mcp.server"]
       cwd: /danjik
+      # defaults 는 한 번만 둔다 — YAML 중복 키는 뒤의 값이 앞을 조용히 덮어쓴다.
+      # 지식 조회(LLM 원문 판단)는 3~6초 걸리고 클라이언트 한도는 20초다(DANJIK_KNOWLEDGE_TIMEOUT).
       defaults:
         timeout_ms: 25000
+        slow_response_threshold_ms: 2000
         slow_response_message: "확인 중입니다. 잠시만 기다려 주세요."
       env:
         PYTHONPATH: /danjik
@@ -261,10 +264,6 @@ mcp:
         enabled: true
         max_restarts: 5
         backoff_ms: 1000
-      defaults:
-        timeout_ms: 5000
-        slow_response_threshold_ms: 2000
-        slow_response_message: "잠시만 기다려 주세요."
       tools:
         - name: search_duty_knowledge
           expose_as: mcp_danjik_search_duty_knowledge
